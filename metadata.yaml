@@ -1,7 +1,7 @@
 name: astrbot_plugin_vertex_bridge
 display_name: Vertex Bridge
 desc: Vertex AI 本地桥接服务，支持 OpenAI 与 Gemini 原生端点转发及嵌入向量生成
-version: 1.1.1
+version: 1.1.2
 author: ElaraKaya
 repo: https://github.com/ElaraKaya/astrbot_plugin_vertex_bridge
 astrbot_version: ">=4.5.7"

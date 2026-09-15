@@ -319,7 +319,7 @@ def _strip_models_prefix(name: str) -> str:
     PLUGIN_NAME,
     "ElaraKaya",
     "Vertex AI 本地桥接服务",
-    "1.1.1",
+    "1.1.2",
     "https://github.com/ElaraKaya/astrbot_plugin_vertex_bridge",
 )
 class VertexBridgePlugin(Star):
@@ -577,20 +577,20 @@ class VertexBridgePlugin(Star):
         resp = await client.post(target_url, headers=headers, json=payload)
         if resp.status_code != 200:
             return web.Response(body=resp.content, status=resp.status_code, content_type="application/json")
-            data = resp.json()
-            predictions = data.get("predictions", [])
-            openai_data = []
-            for idx, pred in enumerate(predictions):
-                emb = pred.get("embeddings", {}).get("values", [])
-                openai_data.append({"object": "embedding", "index": idx, "embedding": emb})
-            return web.json_response(
-                {
-                    "object": "list",
-                    "data": openai_data,
-                    "model": model,
-                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
-                }
-            )
+        data = resp.json()
+        predictions = data.get("predictions", [])
+        openai_data = []
+        for idx, pred in enumerate(predictions):
+            emb = pred.get("embeddings", {}).get("values", [])
+            openai_data.append({"object": "embedding", "index": idx, "embedding": emb})
+        return web.json_response(
+            {
+                "object": "list",
+                "data": openai_data,
+                "model": model,
+                "usage": {"prompt_tokens": 0, "total_tokens": 0},
+            }
+        )
 
     async def handle_openai_models(self, req):
         models = [_strip_models_prefix(m["name"]) for m in self._model_catalog()]
@@ -723,26 +723,26 @@ class VertexBridgePlugin(Star):
         resp = await client.post(target_url, headers=headers, json=vertex_body)
         if resp.status_code != 200:
             return web.Response(body=resp.content, status=resp.status_code, content_type="application/json")
-            v_res = resp.json()
-            candidates = v_res.get("candidates", [])
-            reply_text = ""
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    reply_text = parts[0].get("text", "")
-            return web.json_response(
-                {
-                    "id": f"chatcmpl-{int(time.time())}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": reply_text},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                }
-            )
+        v_res = resp.json()
+        candidates = v_res.get("candidates", [])
+        reply_text = ""
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if parts:
+                reply_text = parts[0].get("text", "")
+        return web.json_response(
+            {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
