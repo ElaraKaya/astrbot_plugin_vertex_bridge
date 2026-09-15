@@ -1,0 +1,45 @@
+{
+  "port": {
+    "description": "本地桥接监听端口",
+    "type": "int",
+    "hint": "默认 18317。桥本身不加鉴权，请自行限制访问来源。",
+    "default": 18317
+  },
+  "region": {
+    "description": "Vertex AI 区域",
+    "type": "string",
+    "default": "us-central1 (美国中部 - 爱荷华)",
+    "options": [
+      "us-central1 (美国中部 - 爱荷华)",
+      "us-west1 (美国西部 - 俄勒冈)",
+      "us-west4 (美国西部 - 拉斯维加斯)",
+      "us-east4 (美国东部 - 北弗吉尼亚)",
+      "us-east1 (美国东部 - 南卡罗来纳)",
+      "asia-east1 (亚太 - 台湾)",
+      "asia-northeast1 (亚太 - 东京)",
+      "asia-southeast1 (亚太 - 新加坡)",
+      "europe-west1 (欧洲 - 比利时)",
+      "europe-west4 (欧洲 - 荷兰)"
+    ],
+    "hint": "选择 Vertex AI 服务部署所在区域。如果在洛杉矶机器上，建议选 us-west1 或 us-west4 延迟最低。"
+  },
+  "sa_file": {
+    "description": "上传 Google Cloud 服务账号 JSON（推荐，文件落到 plugin_data）",
+    "type": "file",
+    "hint": "私钥只保存在 data/plugin_data/astrbot_plugin_vertex_bridge/，不要放进插件源码目录。",
+    "default": [],
+    "file_types": ["json"]
+  },
+  "sa_content": {
+    "description": "一次性粘贴服务账号 JSON。保存后会写入 plugin_data 并清空此项。",
+    "type": "text",
+    "hint": "不要长期把私钥留在框架配置里。留空则使用上面上传的文件。",
+    "default": ""
+  },
+  "sa_path": {
+    "description": "plugin_data 内服务账号路径（自动维护，一般不用改）",
+    "type": "string",
+    "hint": "默认 data/plugin_data/astrbot_plugin_vertex_bridge/vertex-sa.json",
+    "default": ""
+  }
+}
