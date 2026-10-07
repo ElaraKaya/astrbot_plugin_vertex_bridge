@@ -23,6 +23,15 @@ _GLOBAL_SITE = None
 _GLOBAL_RUNNER = None
 
 FALLBACK_CHAT_MODELS = [
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-fable-5-1",
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-fable-5",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
     "gemini-2.5-computer-use-preview-10-2025",
@@ -315,11 +324,23 @@ def _strip_models_prefix(name: str) -> str:
     return text
 
 
+def _is_claude_model(name: str) -> bool:
+    clean = _strip_models_prefix(name).lower()
+    return "claude" in clean
+
+
+def _build_claude_vertex_url(region: str, project: str, model: str, stream: bool = False) -> str:
+    action = "streamRawPredict" if stream else "rawPredict"
+    # Claude on Vertex 默认部署在区域（如 us-central1 / us-east5），如果 region 不是支持的区域则 fallback 到 us-east5
+    target_region = region if region in ("us-east5", "us-central1", "europe-west1") else "us-east5"
+    return f"https://{target_region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{target_region}/publishers/anthropic/models/{model}:{action}"
+
+
 @register(
     PLUGIN_NAME,
     "ElaraKaya",
     "Vertex AI 本地桥接服务",
-    "1.1.2",
+    "1.2.0",
     "https://github.com/ElaraKaya/astrbot_plugin_vertex_bridge",
 )
 class VertexBridgePlugin(Star):
@@ -630,6 +651,155 @@ class VertexBridgePlugin(Star):
                     parts.append({"text": f"[image_url] {url}"})
         return parts or [{"text": ""}]
 
+    async def _handle_claude_chat(self, req, req_data: dict, model: str, token: str, project: str):
+        stream = bool(req_data.get("stream"))
+        messages = req_data.get("messages", [])
+        system_text = ""
+        claude_msgs = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content", "")
+            if role == "system":
+                if isinstance(content, str):
+                    system_text = (system_text + chr(10) + content).strip()
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("text"):
+                            system_text = (system_text + chr(10) + part["text"]).strip()
+            elif role in ("user", "assistant"):
+                c_blocks = []
+                if isinstance(content, str):
+                    c_blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, str):
+                            c_blocks.append({"type": "text", "text": item})
+                        elif isinstance(item, dict):
+                            itype = item.get("type")
+                            if itype == "text" or "text" in item:
+                                c_blocks.append({"type": "text", "text": item.get("text", "")})
+                            elif itype in ("image_url", "image"):
+                                url_obj = item.get("image_url", {})
+                                url = url_obj.get("url", "") if isinstance(url_obj, dict) else str(url_obj)
+                                if url.startswith("data:") and "," in url:
+                                    h, b64 = url.split(",", 1)
+                                    mime = "image/png"
+                                    if ";" in h:
+                                        mime = h[5:].split(";", 1)[0] or mime
+                                    c_blocks.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
+                                else:
+                                    c_blocks.append({"type": "text", "text": f"[image: {url}]"})
+                if c_blocks:
+                    claude_msgs.append({"role": role, "content": c_blocks})
+
+        claude_body: dict[str, Any] = {
+            "anthropic_version": "vertex-2023-10-16",
+            "messages": claude_msgs,
+            "max_tokens": req_data.get("max_tokens", 4096),
+        }
+        if system_text:
+            claude_body["system"] = system_text
+        if "temperature" in req_data:
+            claude_body["temperature"] = req_data["temperature"]
+        if "top_p" in req_data:
+            claude_body["top_p"] = req_data["top_p"]
+
+        target_url = _build_claude_vertex_url(self.region, project, model, stream=stream)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        if stream:
+            claude_body["stream"] = True
+            client = httpx.AsyncClient(timeout=180.0)
+            try:
+                r = await client.post(target_url, headers=headers, json=claude_body)
+                if r.status_code != 200:
+                    body = r.content
+                    await client.aclose()
+                    return web.Response(body=body, status=r.status_code, content_type="application/json")
+                created = int(time.time())
+                res = web.StreamResponse(
+                    status=200,
+                    headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+                )
+                await res.prepare(req)
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    payload = line[6:] if line.startswith("data: ") else line
+                    try:
+                        event_data = json.loads(payload)
+                    except Exception:
+                        continue
+                    etype = event_data.get("type")
+                    text = ""
+                    if etype == "content_block_delta":
+                        delta = event_data.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                    if text:
+                        chunk = {
+                            "id": f"chatcmpl-{created}",
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                        }
+                        await res.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode())
+                done = {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                await res.write(("data: " + json.dumps(done) + "\n\n").encode())
+                await res.write(b"data: [DONE]\n\n")
+                await res.write_eof()
+                await r.aclose()
+                await client.aclose()
+                return res
+            except Exception as e:
+                await client.aclose()
+                return web.json_response({"error": f"Claude proxy request failed: {e}"}, status=500)
+
+        client = self._get_http_client()
+        resp = await client.post(target_url, headers=headers, json=claude_body)
+        if resp.status_code != 200:
+            return web.Response(body=resp.content, status=resp.status_code, content_type="application/json")
+        c_res = resp.json()
+        reply_text = ""
+        c_content = c_res.get("content", [])
+        if isinstance(c_content, list):
+            for block in c_content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    reply_text += block.get("text", "")
+        usage = c_res.get("usage", {})
+        prompt_tokens = usage.get("input_tokens", 0)
+        completion_tokens = usage.get("output_tokens", 0)
+        return web.json_response(
+            {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            }
+        )
+
     async def handle_openai_chat(self, req):
         try:
             req_data = await req.json()
@@ -640,6 +810,9 @@ class VertexBridgePlugin(Star):
             project = self.token_mgr.project_id
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
+
+        if _is_claude_model(model):
+            return await self._handle_claude_chat(req, req_data, model, token, project)
 
         contents = []
         system_instruction = None
