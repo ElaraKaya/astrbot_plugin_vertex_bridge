@@ -10,6 +10,7 @@
     "type": "string",
     "default": "us-central1 (美国中部 - 爱荷华)",
     "options": [
+      "global (全局端点)",
       "us-central1 (美国中部 - 爱荷华)",
       "us-west1 (美国西部 - 俄勒冈)",
       "us-west4 (美国西部 - 拉斯维加斯)",

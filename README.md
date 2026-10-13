@@ -24,3 +24,8 @@ WebUI 上传服务账号 JSON（推荐），或一次性粘贴 JSON。保存后�
 ## 依赖
 
 `httpx`、`google-auth`、`aiohttp`
+
+## 更新日志
+
+- `v1.2.1`：新增 `gemini-4-argon` 模型目录与全局端点自动路由支持，配置新增 `global (全局端点)` 区域选项。
+- `v1.2.0`：新增 Claude 5 / 4 系列模型支持与 Gemini 3.x 全局端点路由。

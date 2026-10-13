@@ -67,6 +67,7 @@ FALLBACK_CHAT_MODELS = [
     "gemini-3.6-flash",
     "gemini-3.7-flash",
     "gemini-3.8-flash",
+    "gemini-4-argon",
     "gemini-embedding-001",
     "gemini-embedding-2",
     "gemini-embedding-2-preview",
@@ -90,8 +91,14 @@ _GLOBAL_ENDPOINT_MODELS = {
     "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.5-live-translate-preview",
     "gemini-3.5-transcribe", "gemini-3.5-transcribe-live",
     "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
+    "gemini-4-argon",
     "gemini-omni-1.1-flash", "gemini-omni-flash", "gemini-omni-flash-preview",
 }
+
+
+def _is_global_endpoint_model(model: str) -> bool:
+    base = model.split(":")[0]
+    return base in _GLOBAL_ENDPOINT_MODELS or base.startswith(("gemini-3", "gemini-4"))
 FALLBACK_EMBED_MODELS = ["text-embedding-004"]
 
 
@@ -299,14 +306,15 @@ class TokenManager:
 
 def _build_vertex_url(region: str, project: str, model: str, action: str, extra_qs: str = "") -> str:
     """根据模型名称选择正确的端点前缀（全局 vs 区域）。"""
-    base_model = model.split(":")[0]  # 去掉可能已附带的 action
-    if base_model in _GLOBAL_ENDPOINT_MODELS:
+    if region == "global" or _is_global_endpoint_model(model):
         host = "aiplatform.googleapis.com"
+        loc = "global"
     else:
         host = f"{region}-aiplatform.googleapis.com"
+        loc = region
     url = (
         f"https://{host}/v1/projects/{project}"
-        f"/locations/{region}/publishers/google/models/{model}:{action}"
+        f"/locations/{loc}/publishers/google/models/{model}:{action}"
     )
     if extra_qs:
         url += f"?{extra_qs}"
@@ -340,7 +348,7 @@ def _build_claude_vertex_url(region: str, project: str, model: str, stream: bool
     PLUGIN_NAME,
     "ElaraKaya",
     "Vertex AI 本地桥接服务",
-    "1.2.0",
+    "1.2.1",
     "https://github.com/ElaraKaya/astrbot_plugin_vertex_bridge",
 )
 class VertexBridgePlugin(Star):
@@ -456,8 +464,9 @@ class VertexBridgePlugin(Star):
             yield event.plain_result(f"凭证获取失败: {e}")
             return
 
+        host = "aiplatform.googleapis.com" if self.region == "global" else f"{self.region}-aiplatform.googleapis.com"
         url = (
-            f"https://{self.region}-aiplatform.googleapis.com/v1/projects/{project}"
+            f"https://{host}/v1/projects/{project}"
             f"/locations/{self.region}/publishers/google/models"
         )
         headers = {"Authorization": f"Bearer {token}"}
@@ -537,15 +546,16 @@ class VertexBridgePlugin(Star):
         if clean_tail.startswith("models/"):
             clean_tail = clean_tail[len("models/") :]
 
-        # gemini-3.8+ 用全局端点，其余用区域端点
-        base_model_name = clean_tail.split(":")[0]
-        if base_model_name in _GLOBAL_ENDPOINT_MODELS:
+        # gemini-3+ / gemini-4+ 用全局端点，其余用区域端点
+        if self.region == "global" or _is_global_endpoint_model(clean_tail):
             host = "aiplatform.googleapis.com"
+            loc = "global"
         else:
             host = f"{self.region}-aiplatform.googleapis.com"
+            loc = self.region
         target_url = (
             f"https://{host}/v1/projects/{project}"
-            f"/locations/{self.region}/publishers/google/models/{clean_tail}"
+            f"/locations/{loc}/publishers/google/models/{clean_tail}"
         )
         if req.query_string:
             target_url += f"?{req.query_string}"
