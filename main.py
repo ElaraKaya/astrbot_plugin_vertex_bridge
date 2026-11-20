@@ -13,8 +13,18 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
+
+import importlib
+try:
+    from . import responses_api as _responses_api_mod
+    importlib.reload(_responses_api_mod)
+    from .responses_api import VertexResponsesEndpoint
+except ImportError:  # 直接以顶层模块加载时的兜底
+    import responses_api as _responses_api_mod
+    importlib.reload(_responses_api_mod)
+    from responses_api import VertexResponsesEndpoint
 
 PLUGIN_NAME = "astrbot_plugin_vertex_bridge"
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -100,6 +110,16 @@ def _is_global_endpoint_model(model: str) -> bool:
     base = model.split(":")[0]
     return base in _GLOBAL_ENDPOINT_MODELS or base.startswith(("gemini-3", "gemini-4"))
 FALLBACK_EMBED_MODELS = ["text-embedding-004"]
+
+# 实时拉取失败、切到内置兜底列表时，置顶在最前面的占位模型（不映射到任何真实模型）
+FALLBACK_NOTICE_MODEL = "!!!兜底列表-实时拉取失败"
+FALLBACK_NOTICE_DESC = (
+    "实时拉取 Vertex 模型列表失败，当前返回的是插件内置的兜底列表，可能不是最新。"
+    "此条仅作提示，不对应任何真实模型，请勿调用。"
+)
+LIVE_MODELS_URL = "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"
+LIVE_MODELS_TTL = 300.0   # 拉取成功后的缓存秒数
+LIVE_MODELS_FAIL_TTL = 30.0  # 拉取失败后的冷却秒数，避免反复打 Vertex
 
 
 def _plugin_data_dir() -> Path:
@@ -348,7 +368,7 @@ def _build_claude_vertex_url(region: str, project: str, model: str, stream: bool
     PLUGIN_NAME,
     "ElaraKaya",
     "Vertex AI 本地桥接服务",
-    "1.2.1",
+    "1.4.1",
     "https://github.com/ElaraKaya/astrbot_plugin_vertex_bridge",
 )
 class VertexBridgePlugin(Star):
@@ -358,7 +378,13 @@ class VertexBridgePlugin(Star):
         self.port = int(self.config.get("port", 18317))
         raw_region = str(self.config.get("region", "us-central1")).strip() or "us-central1"
         self.region = raw_region.split()[0].split("(")[0].strip() or "us-central1"
-        self.http_client = httpx.AsyncClient(timeout=120.0)
+        self.enable_flex = bool(self.config.get("enable_flex", True))
+        self._live_models: list[str] | None = None
+        self._live_models_ts = 0.0
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0, connect=20.0),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=20.0),
+        )
         self.sa_file = self.config.get("sa_file", [])
         self.sa_content = str(self.config.get("sa_content", "")).strip()
         self.sa_path = str(self.config.get("sa_path", "")).strip()
@@ -367,11 +393,22 @@ class VertexBridgePlugin(Star):
         self._scrub_config_secrets()
         self._purge_plugin_dir_secrets()
         self.app = web.Application()
+        self.responses_endpoint = VertexResponsesEndpoint(
+            self.token_mgr,
+            self.region,
+            self._get_http_client,
+            enabled=bool(self.config.get("enable_responses", False)),
+            models=self._responses_model_list(),
+            enable_flex=self.enable_flex,
+        )
         self._setup_proxy_routes()
 
     def _get_http_client(self) -> httpx.AsyncClient:
         if not hasattr(self, "http_client") or self.http_client.is_closed:
-            self.http_client = httpx.AsyncClient(timeout=120.0)
+            self.http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(180.0, connect=20.0),
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=20.0),
+            )
         return self.http_client
 
     def _scrub_config_secrets(self) -> None:
@@ -410,12 +447,20 @@ class VertexBridgePlugin(Star):
     async def initialize(self) -> None:
         await self._start_server()
 
+    def _responses_model_list(self) -> list[str]:
+        raw = self.config.get("responses_models", "")
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return [m.strip() for m in str(raw or "").replace(chr(10), ",").split(",") if m.strip()]
+
     def _setup_proxy_routes(self):
         self.app.router.add_get("/v1/models", self.handle_openai_models)
         self.app.router.add_post("/v1/chat/completions", self.handle_openai_chat)
         self.app.router.add_post("/v1/embeddings", self.handle_openai_embeddings)
         self.app.router.add_route("*", "/v1beta/{tail:.*}", self.handle_gemini_native)
+        self.app.router.add_route("*", "/v1/models/{tail:.+}", self.handle_gemini_native)
         self.app.router.add_get("/health", self.handle_health)
+        self.responses_endpoint.register(self.app.router)
 
     async def _start_server(self):
         global _GLOBAL_SITE, _GLOBAL_RUNNER
@@ -457,44 +502,14 @@ class VertexBridgePlugin(Star):
     @filter.command("vmodels", alias={"vertex_models"})
     async def cmd_list_models(self, event: AstrMessageEvent):
         """实时拉取 Vertex AI 全量可用模型列表"""
-        try:
-            token = self.token_mgr.get_token()
-            project = self.token_mgr.project_id
-        except Exception as e:
-            yield event.plain_result(f"凭证获取失败: {e}")
+        self._live_models = None
+        self._live_models_ts = 0.0
+        names = await self._fetch_live_models()
+        if names is None:
+            yield event.plain_result("实时拉取失败，当前 /v1/models 返回的是内置兜底列表，详见日志。")
             return
-
-        host = "aiplatform.googleapis.com" if self.region == "global" else f"{self.region}-aiplatform.googleapis.com"
-        url = (
-            f"https://{host}/v1/projects/{project}"
-            f"/locations/{self.region}/publishers/google/models"
-        )
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                body_preview = resp.text[:300]
-                msg = "API 返回 " + str(resp.status_code) + ":\n" + body_preview
-                yield event.plain_result(msg)
-                return
-            data = resp.json()
-            models = data.get("publisherModels", data.get("models", []))
-            if not models:
-                yield event.plain_result("没拉到模型，返回体为空。")
-                return
-            lines = []
-            for m in models:
-                name = m.get("name", "")
-                # 只取最后一段作为短名
-                short = name.rsplit("/", 1)[-1] if "/" in name else name
-                lines.append(short)
-            lines.sort()
-            total = len(lines)
-            text = "Vertex 全量模型 (" + str(total) + " 个):\n" + "\n".join(lines)
-            yield event.plain_result(text)
-        except Exception as e:
-            yield event.plain_result(f"拉取失败: {e}")
+        lines = sorted(names)
+        yield event.plain_result("Vertex 全量模型 (" + str(len(lines)) + " 个):\n" + "\n".join(lines))
 
     async def handle_health(self, req):
         return web.json_response(
@@ -503,29 +518,73 @@ class VertexBridgePlugin(Star):
                 "project_id": self.token_mgr.project_id or "not_configured",
                 "region": self.region,
                 "port": self.port,
+                "flex": self.enable_flex,
                 "ready": bool(self.token_mgr.credentials),
                 "source": self.token_mgr.source,
             }
         )
 
-    def _model_catalog(self) -> list[dict[str, Any]]:
-        models: list[dict[str, Any]] = []
-        for name in FALLBACK_CHAT_MODELS:
-            models.append(
-                {
-                    "name": f"models/{name}",
-                    "displayName": name,
-                    "supportedGenerationMethods": ["generateContent", "countTokens"],
-                }
-            )
-        for name in FALLBACK_EMBED_MODELS:
-            models.append(
-                {
-                    "name": f"models/{name}",
-                    "displayName": name,
-                    "supportedGenerationMethods": ["embedContent"],
-                }
-            )
+    async def _fetch_live_models(self) -> list[str] | None:
+        """实时拉取 google publisher 的模型名；失败返回 None。带缓存与失败冷却。"""
+        now = time.time()
+        if self._live_models is not None and now - self._live_models_ts < LIVE_MODELS_TTL:
+            return self._live_models
+        if self._live_models is None and self._live_models_ts and now - self._live_models_ts < LIVE_MODELS_FAIL_TTL:
+            return None
+        try:
+            token = self.token_mgr.get_token()
+            client = self._get_http_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            names: list[str] = []
+            page_token = ""
+            for _ in range(10):
+                url = f"{LIVE_MODELS_URL}?pageSize=100"
+                if page_token:
+                    url += f"&pageToken={page_token}"
+                resp = await client.get(url, headers=headers, timeout=10.0)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                data = resp.json()
+                for m in data.get("publisherModels", []):
+                    short = str(m.get("name", "")).rsplit("/", 1)[-1]
+                    if short and short not in names:
+                        names.append(short)
+                page_token = data.get("nextPageToken") or ""
+                if not page_token:
+                    break
+            if not names:
+                raise RuntimeError("返回的模型列表为空")
+            self._live_models = names
+            self._live_models_ts = now
+            return names
+        except Exception as e:
+            logger.warning(f"实时拉取 Vertex 模型列表失败，切换兜底列表: {e}")
+            self._live_models = None
+            self._live_models_ts = now
+            return None
+
+    @staticmethod
+    def _catalog_item(name: str, desc: str = "") -> dict[str, Any]:
+        methods = ["embedContent"] if "embedding" in name else ["generateContent", "countTokens"]
+        item: dict[str, Any] = {
+            "name": f"models/{name}",
+            "displayName": name,
+            "supportedGenerationMethods": methods,
+        }
+        if desc:
+            item["description"] = desc
+        return item
+
+    async def _model_catalog(self) -> list[dict[str, Any]]:
+        live = await self._fetch_live_models()
+        if live is not None:
+            # google 接口不含 Anthropic 的 Claude，这部分只能沿用内置名单
+            extra = [m for m in FALLBACK_CHAT_MODELS if m not in live and m.startswith("claude")]
+            return [self._catalog_item(n) for n in live + extra]
+        # 拉取失败：置顶提示项 + 内置兜底列表
+        models = [self._catalog_item(FALLBACK_NOTICE_MODEL, FALLBACK_NOTICE_DESC)]
+        models += [self._catalog_item(n) for n in FALLBACK_CHAT_MODELS]
+        models += [self._catalog_item(n) for n in FALLBACK_EMBED_MODELS]
         return models
 
     async def handle_gemini_native(self, req):
@@ -533,7 +592,7 @@ class VertexBridgePlugin(Star):
         method = req.method
 
         if tail == "models" or tail.startswith("models?"):
-            return web.json_response({"models": self._model_catalog()})
+            return web.json_response({"models": await self._model_catalog()})
 
         body = await req.read()
         try:
@@ -564,6 +623,9 @@ class VertexBridgePlugin(Star):
             "Authorization": f"Bearer {token}",
             "Content-Type": req.headers.get("Content-Type", "application/json"),
         }
+        if self.enable_flex:
+            headers["X-Vertex-AI-LLM-Request-Type"] = "shared"
+            headers["X-Vertex-AI-LLM-Shared-Request-Type"] = "flex"
 
         client = httpx.AsyncClient(timeout=180.0)
         try:
@@ -624,11 +686,18 @@ class VertexBridgePlugin(Star):
         )
 
     async def handle_openai_models(self, req):
-        models = [_strip_models_prefix(m["name"]) for m in self._model_catalog()]
-        data = [
-            {"id": m, "object": "model", "created": int(time.time()), "owned_by": "google"}
-            for m in models
-        ]
+        catalog = await self._model_catalog()
+        data = []
+        for m in catalog:
+            item = {
+                "id": _strip_models_prefix(m["name"]),
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "google",
+            }
+            if m.get("description"):
+                item["description"] = m["description"]
+            data.append(item)
         return web.json_response({"object": "list", "data": data})
 
     def _openai_content_to_parts(self, content: Any) -> list[dict]:
@@ -821,6 +890,9 @@ class VertexBridgePlugin(Star):
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
 
+        if model == FALLBACK_NOTICE_MODEL:
+            return web.json_response({"error": FALLBACK_NOTICE_DESC}, status=400)
+
         if _is_claude_model(model):
             return await self._handle_claude_chat(req, req_data, model, token, project)
 
@@ -848,6 +920,9 @@ class VertexBridgePlugin(Star):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        if self.enable_flex:
+            headers["X-Vertex-AI-LLM-Request-Type"] = "shared"
+            headers["X-Vertex-AI-LLM-Shared-Request-Type"] = "flex"
 
         if stream:
             client = httpx.AsyncClient(timeout=180.0)
@@ -875,8 +950,9 @@ class VertexBridgePlugin(Star):
                     cands = obj.get("candidates") or []
                     if cands:
                         parts = cands[0].get("content", {}).get("parts") or []
-                        if parts:
-                            text = parts[0].get("text", "")
+                        for p in parts:
+                            if not p.get("thought") and p.get("text"):
+                                text += p["text"]
                     chunk = {
                         "id": f"chatcmpl-{created}",
                         "object": "chat.completion.chunk",
@@ -911,8 +987,12 @@ class VertexBridgePlugin(Star):
         reply_text = ""
         if candidates:
             parts = candidates[0].get("content", {}).get("parts", [])
-            if parts:
-                reply_text = parts[0].get("text", "")
+            for p in parts:
+                if not p.get("thought") and p.get("text"):
+                    reply_text += p["text"]
+        usage_meta = v_res.get("usageMetadata", {})
+        prompt_tokens = usage_meta.get("promptTokenCount", 0)
+        completion_tokens = usage_meta.get("candidatesTokenCount", 0) + usage_meta.get("thoughtsTokenCount", 0)
         return web.json_response(
             {
                 "id": f"chatcmpl-{int(time.time())}",
@@ -926,6 +1006,10 @@ class VertexBridgePlugin(Star):
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
             }
         )

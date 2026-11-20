@@ -42,5 +42,23 @@
     "type": "string",
     "hint": "默认 data/plugin_data/astrbot_plugin_vertex_bridge/vertex-sa.json",
     "default": ""
+  },
+  "enable_responses": {
+    "description": "启用 /v1/responses 节点（OpenAI Responses API 兼容，底层走 Interactions API）",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时该路由不注册，访问返回 404。仅支持 gemini-3.x / gemini-4 系列模型。"
+  },
+  "enable_flex": {
+    "description": "启用 Flex 降本推理模式（约 50% 费用折扣，允许排队）",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启。向 Vertex AI Gemini 端点发送请求时附带 Flex 请求头 (X-Vertex-AI-LLM-Request-Type / X-Vertex-AI-LLM-Shared-Request-Type)。非 Gemini 模型（如 Claude/Embedding）自动忽略。"
+  },
+  "responses_models": {
+    "description": "/v1/responses 允许的模型白名单（逗号分隔）",
+    "type": "string",
+    "default": "",
+    "hint": "留空表示不额外限制。Interactions API 本身只接受 gemini-3.x / gemini-4，填 embedding 之类会直接 400。"
   }
 }
